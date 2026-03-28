@@ -44,7 +44,7 @@ async def predict_image(file: UploadFile = File(...)):
         img = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(img, cv2.IMREAD_COLOR)
         img = cv2.resize(img, (640, 480))
-        results = model(img, imgsz=640)
+        results = model(img, imgsz=640, conf=0.3)
         boxes = results[0].boxes
 
         aircraft = 0
