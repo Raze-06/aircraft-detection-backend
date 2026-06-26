@@ -1,66 +1,68 @@
-from fastapi import FastAPI, UploadFile, File, Request
+from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
 from ultralytics import YOLO
 import cv2
 import numpy as np
 import base64
 from fastapi.middleware.cors import CORSMiddleware
+import tempfile
 from fastapi.staticfiles import StaticFiles
 import tempfile
 import uuid
-import os
+from pydantic import BaseModel
+
+from tile_pipeline import (
+    get_dummy_airbase_response,
+    is_supported_airbase,
+    run_airbase_detection,
+)
 
 app = FastAPI()
 
-# ✅ Ensure static folder exists
-os.makedirs("static", exist_ok=True)
 
-# ✅ CORS (allow frontend)
 app.add_middleware(
-    CORSMiddleware,
+    CORSMiddleware, 
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ✅ Mount static folder
 app.mount("/static", StaticFiles(directory="static"), name="static")
+# Load model
+model = YOLO("best.pt")
 
-# ✅ Fix model path (IMPORTANT for deployment)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "best.pt")
-
-model = YOLO(MODEL_PATH)
+class AirbaseDetectionRequest(BaseModel):
+    area_name: str
 
 
-# ==========================
-# 📸 IMAGE DETECTION
-# ==========================
 @app.post("/predict-image")
 async def predict_image(file: UploadFile = File(...)):
     try:
+        # Read image
         image_bytes = await file.read()
         img = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(img, cv2.IMREAD_COLOR)
-        img = cv2.resize(img, (640, 480))
-        results = model(img, imgsz=640, conf=0.3, verbose=False)
+        # Run YOLO
+        results = model(img, conf=0.4)
         boxes = results[0].boxes
 
         aircraft = 0
         helicopters = 0
         fighter_jets = 0
 
-        if boxes is not None:
-            for box in boxes:
-                cls = int(box.cls[0])
+        for box in boxes:
+            cls = int(box.cls[0])
+            conf = float(box.conf[0])
+            if conf < 0.4:
+                continue
 
-                if cls == 0:
-                    fighter_jets += 1
-                elif cls == 1:
-                    aircraft += 1
-                elif cls == 2:
-                    helicopters += 1
+            if cls == 0:
+                fighter_jets += 1
+            elif cls == 1:
+                aircraft += 1
+            elif cls == 2:
+                helicopters += 1
 
         annotated = results[0].plot()
 
@@ -76,51 +78,41 @@ async def predict_image(file: UploadFile = File(...)):
 
     except Exception as e:
         return JSONResponse({"error": str(e)})
+    
 
-
-# ==========================
-# 🎥 VIDEO DETECTION + TRACKING
-# ==========================
 @app.post("/predict-video")
-async def predict_video(request: Request, file: UploadFile = File(...)):
+async def predict_video(file: UploadFile = File(...)):
     try:
-        # Save uploaded video temporarily
         temp_input = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         temp_input.write(await file.read())
         temp_input.close()
 
         cap = cv2.VideoCapture(temp_input.name)
 
-        # Output video
+        # Output video path
         output_filename = f"output_{uuid.uuid4().hex}.mp4"
         output_path = f"static/{output_filename}"
 
-        fps = int(cap.get(cv2.CAP_PROP_FPS)) or 25
+        # Get video properties
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        # ✅ FIXED codec (important for deployment)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        fourcc = cv2.VideoWriter_fourcc(*"avc1")
         out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-
         if not out.isOpened():
             raise Exception("VideoWriter failed to open")
 
-        # Tracking sets (avoid duplicate counting)
         aircraft_ids = set()
         helicopter_ids = set()
         fighter_jet_ids = set()
-
         frame_count = 0
-
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
 
             frame_count += 1
-
-            # ✅ Frame skipping (performance)
             if frame_count % 3 != 0:
                 continue
 
@@ -141,21 +133,32 @@ async def predict_video(request: Request, file: UploadFile = File(...)):
                     elif cls == 2:
                         helicopter_ids.add(obj_id)
 
+            #  Draw boxes + IDs
             annotated = res.plot()
+
             out.write(annotated)
 
         cap.release()
         out.release()
 
-        # ✅ Dynamic base URL (IMPORTANT for deployment)
-        base_url = str(request.base_url)
-
         return {
             "aircraft": len(aircraft_ids),
             "helicopters": len(helicopter_ids),
             "fighter_jets": len(fighter_jet_ids),
-            "video_url": f"{base_url}static/{output_filename}"
+            "video_url": f"http://127.0.0.1:8000/static/{output_filename}"
         }
 
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.post("/detect-airbase")
+async def detect_airbase(payload: AirbaseDetectionRequest):
+    try:
+        area_name = payload.area_name.strip() if payload.area_name else ""
+        if is_supported_airbase(area_name):
+            return run_airbase_detection(model=model, area_name=area_name)
+
+        return get_dummy_airbase_response(area_name)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
